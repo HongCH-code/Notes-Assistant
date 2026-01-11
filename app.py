@@ -34,6 +34,7 @@ CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 NOTION_API_KEY = os.getenv('NOTION_API_KEY')
 NOTION_DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
+NOTION_SUMMARY_DATABASE_ID = os.getenv('NOTION_SUMMARY_DATABASE_ID')
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
     raise ValueError('請設定 LINE_CHANNEL_ACCESS_TOKEN 和 LINE_CHANNEL_SECRET 環境變數')
@@ -43,6 +44,9 @@ if not OPENAI_API_KEY:
 
 if not NOTION_API_KEY or not NOTION_DATABASE_ID:
     raise ValueError('請設定 NOTION_API_KEY 和 NOTION_DATABASE_ID 環境變數')
+
+if not NOTION_SUMMARY_DATABASE_ID:
+    raise ValueError('請設定 NOTION_SUMMARY_DATABASE_ID 環境變數')
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
@@ -78,7 +82,7 @@ def generate_tags(text):
 
 
 def save_to_notion(content, duration_seconds, tags):
-    """將筆記儲存到 Notion database"""
+    """將語音筆記儲存到 Notion database"""
     try:
         # 從內容中擷取前 50 個字元作為標題
         title = content[:50] + "..." if len(content) > 50 else content
@@ -124,6 +128,96 @@ def save_to_notion(content, duration_seconds, tags):
         return False
 
 
+def generate_summary_and_category(text):
+    """使用 OpenAI 生成文字摘要和內容分類"""
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """你是一個文字摘要助手。請分析使用者提供的文字，並回傳 JSON 格式的結果，包含：
+1. category: 內容類別（單一類別，例如：工作、學習、新聞、生活、想法、技術、商業等）
+2. summary: 重點摘要（濃縮成 2-3 句話，保留關鍵資訊）
+
+請只回傳 JSON，不要有其他文字。"""
+                },
+                {
+                    "role": "user",
+                    "content": f"請分析以下文字：\n\n{text}"
+                }
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        import json
+        result = json.loads(response.choices[0].message.content)
+        return result.get('summary', ''), result.get('category', '未分類')
+    except Exception as e:
+        app.logger.error(f"生成摘要時發生錯誤: {str(e)}")
+        # 如果失敗，返回簡單的摘要
+        simple_summary = text[:200] + "..." if len(text) > 200 else text
+        return simple_summary, "未分類"
+
+
+def save_summary_to_notion(content, summary, category):
+    """將文字摘要儲存到 Notion summary database"""
+    try:
+        # 從摘要中擷取前 50 個字元作為標題
+        title = summary[:50] + "..." if len(summary) > 50 else summary
+
+        # 建立 Notion page
+        notion_client.pages.create(
+            parent={"database_id": NOTION_SUMMARY_DATABASE_ID},
+            properties={
+                "Name": {
+                    "title": [
+                        {
+                            "text": {
+                                "content": title
+                            }
+                        }
+                    ]
+                },
+                "Content": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": content
+                            }
+                        }
+                    ]
+                },
+                "Category": {
+                    "multi_select": [
+                        {
+                            "name": category
+                        }
+                    ]
+                },
+                "Summary": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": summary
+                            }
+                        }
+                    ]
+                },
+                "Created": {
+                    "date": {
+                        "start": datetime.now().isoformat()
+                    }
+                }
+            }
+        )
+        return True
+    except Exception as e:
+        app.logger.error(f"儲存摘要到 Notion 時發生錯誤: {str(e)}")
+        return False
+
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
     """Line Bot 的 webhook endpoint"""
@@ -144,19 +238,105 @@ def webhook():
     return 'OK'
 
 
+def process_summary_background(text, user_id):
+    """背景處理文字摘要的函數"""
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            # 使用 AI 生成摘要和分類
+            summary, category = generate_summary_and_category(text)
+
+            # 儲存到 Notion
+            saved = save_summary_to_notion(text, summary, category)
+
+            # 準備推送訊息
+            if saved:
+                push_text = f"✅ 已儲存到 Notion\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
+            else:
+                push_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
+
+            # 使用 push message 發送結果
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=push_text)]
+                )
+            )
+
+    except Exception as e:
+        app.logger.error(f"背景處理文字摘要時發生錯誤: {str(e)}")
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text="抱歉，處理文字摘要時發生錯誤。")]
+                    )
+                )
+        except:
+            pass
+
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    """處理文字訊息，並回傳相同的訊息（Echo Bot）"""
+    """處理文字訊息，支援 /a 指令進行文字摘要"""
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
-        # 回傳使用者傳來的訊息
-        line_bot_api.reply_message_with_http_info(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=event.message.text)]
+        try:
+            text = event.message.text.strip()
+
+            # 檢查是否為 /a 指令（文字摘要功能）
+            if text.startswith('/a'):
+                # 提取實際內容（去掉 /a 指令）
+                content = text[2:].strip()
+
+                if not content:
+                    # 如果沒有內容，提示用戶
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text="請在 /a 後面加上要摘要的文字內容\n\n範例：\n/a 這是一段很長的文章內容...")]
+                        )
+                    )
+                    return
+
+                # 立即回覆「處理中」
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="📝 收到文字內容，正在生成摘要...")]
+                    )
+                )
+
+                # 啟動背景線程處理摘要
+                user_id = event.source.user_id
+                thread = threading.Thread(
+                    target=process_summary_background,
+                    args=(content, user_id)
+                )
+                thread.daemon = True
+                thread.start()
+
+            else:
+                # 一般文字訊息，Echo Bot 行為
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=text)]
+                    )
+                )
+
+        except Exception as e:
+            app.logger.error(f"處理文字訊息時發生錯誤: {str(e)}")
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="抱歉，處理訊息時發生錯誤。")]
+                )
             )
-        )
 
 
 def process_audio_background(message_id, user_id, duration_seconds):

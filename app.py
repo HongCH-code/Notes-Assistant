@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 from datetime import datetime
 from flask import Flask, request, abort
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ from linebot.v3.messaging import (
     MessagingApi,
     MessagingApiBlob,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage
 )
 from linebot.v3.webhooks import (
@@ -157,19 +159,15 @@ def handle_text_message(event):
         )
 
 
-@handler.add(MessageEvent, message=AudioMessageContent)
-def handle_audio_message(event):
-    """處理語音訊息，轉成文字並儲存到 Notion"""
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_blob_api = MessagingApiBlob(api_client)
-
-        try:
-            # 獲取語音長度（毫秒轉秒）
-            duration_seconds = event.message.duration / 1000
+def process_audio_background(message_id, user_id, duration_seconds):
+    """背景處理語音訊息的函數"""
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_blob_api = MessagingApiBlob(api_client)
 
             # 從 Line 下載語音檔案
-            message_content = line_bot_blob_api.get_message_content(event.message.id)
+            message_content = line_bot_blob_api.get_message_content(message_id)
 
             # 將語音內容寫入臨時檔案
             with tempfile.NamedTemporaryFile(delete=False, suffix='.m4a') as temp_audio:
@@ -181,7 +179,7 @@ def handle_audio_message(event):
                 transcription = openai_client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file,
-                    language="zh"  # 設定為中文，也可以設為 None 讓它自動偵測
+                    language="zh"
                 )
 
             # 刪除臨時檔案
@@ -196,19 +194,63 @@ def handle_audio_message(event):
             # 儲存到 Notion
             saved = save_to_notion(transcribed_text, duration_seconds, tags)
 
-            # 準備回覆訊息
+            # 準備推送訊息
             if saved:
-                reply_text = f"✅ 已儲存到 Notion\n\n你說：{transcribed_text}\n\n標籤：{', '.join(tags)}"
+                push_text = f"✅ 已儲存到 Notion\n\n你說：{transcribed_text}\n\n標籤：{', '.join(tags)}"
             else:
-                reply_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n你說：{transcribed_text}"
+                push_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n你說：{transcribed_text}"
 
-            # 回傳結果
+            # 使用 push message 發送結果
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=push_text)]
+                )
+            )
+
+    except Exception as e:
+        app.logger.error(f"背景處理語音訊息時發生錯誤: {str(e)}")
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text="抱歉，處理語音訊息時發生錯誤。")]
+                    )
+                )
+        except:
+            pass
+
+
+@handler.add(MessageEvent, message=AudioMessageContent)
+def handle_audio_message(event):
+    """處理語音訊息，立即回應並在背景處理"""
+    # 立即回應 Line，避免 timeout
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+
+        try:
+            # 獲取必要資訊
+            message_id = event.message.id
+            user_id = event.source.user_id
+            duration_seconds = event.message.duration / 1000
+
+            # 立即回覆「處理中」
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)]
+                    messages=[TextMessage(text="🎤 收到語音訊息，正在處理中...")]
                 )
             )
+
+            # 啟動背景線程處理
+            thread = threading.Thread(
+                target=process_audio_background,
+                args=(message_id, user_id, duration_seconds)
+            )
+            thread.daemon = True
+            thread.start()
 
         except Exception as e:
             app.logger.error(f"處理語音訊息時發生錯誤: {str(e)}")

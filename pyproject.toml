@@ -10,4 +10,8 @@ dependencies = [
     "notion-client>=2.7.0",
     "openai>=2.15.0",
     "python-dotenv>=1.2.1",
+    "google-auth>=2.29.0",
+    "google-auth-oauthlib>=1.2.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-api-python-client>=2.119.0",
 ]

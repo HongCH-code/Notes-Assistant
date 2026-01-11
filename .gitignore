@@ -11,3 +11,10 @@ wheels/
 
 # Environment variables
 .env
+
+# Google OAuth credentials
+credentials.json
+token.json
+
+# macOS
+.DS_Store

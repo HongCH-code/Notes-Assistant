@@ -20,7 +20,8 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
-    AudioMessageContent
+    AudioMessageContent,
+    ImageMessageContent
 )
 
 # 載入 .env 檔案
@@ -35,6 +36,10 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 NOTION_API_KEY = os.getenv('NOTION_API_KEY')
 NOTION_DATABASE_ID = os.getenv('NOTION_DATABASE_ID')
 NOTION_SUMMARY_DATABASE_ID = os.getenv('NOTION_SUMMARY_DATABASE_ID')
+NOTION_IMAGE_DATABASE_ID = os.getenv('NOTION_IMAGE_DATABASE_ID')
+GOOGLE_CREDENTIALS_PATH = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
+GOOGLE_TOKEN_PATH = os.getenv('GOOGLE_TOKEN_PATH', 'token.json')
+GOOGLE_DRIVE_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
     raise ValueError('請設定 LINE_CHANNEL_ACCESS_TOKEN 和 LINE_CHANNEL_SECRET 環境變數')
@@ -47,6 +52,9 @@ if not NOTION_API_KEY or not NOTION_DATABASE_ID:
 
 if not NOTION_SUMMARY_DATABASE_ID:
     raise ValueError('請設定 NOTION_SUMMARY_DATABASE_ID 環境變數')
+
+if not NOTION_IMAGE_DATABASE_ID:
+    raise ValueError('請設定 NOTION_IMAGE_DATABASE_ID 環境變數')
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
@@ -161,6 +169,61 @@ def generate_summary_and_category(text):
         return simple_summary, "未分類"
 
 
+def analyze_image_with_vision(image_bytes):
+    """使用 OpenAI Vision API 分析圖片內容"""
+    try:
+        import base64
+        import json
+
+        # 將圖片編碼為 base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """你是一個圖片分析助手。請分析圖片並回傳 JSON 格式：
+1. description: 圖片的詳細描述（2-3 句話，描述主要內容、場景、物體等）
+2. tags: 內容標籤（3-5 個中文標籤，例如：風景、食物、人物、工作、生活等）
+
+請只回傳 JSON，不要有其他文字。"""
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "請分析這張圖片"
+                        }
+                    ]
+                }
+            ],
+            temperature=0.3,
+            max_tokens=500,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        description = result.get('description', '圖片內容')
+        tags = result.get('tags', ['未分類'])
+
+        # 確保 tags 是列表
+        if isinstance(tags, str):
+            tags = [tags]
+
+        return description, tags
+    except Exception as e:
+        app.logger.error(f"分析圖片時發生錯誤: {str(e)}")
+        return "圖片內容", ["未分類"]
+
+
 def save_summary_to_notion(content, summary, category):
     """將文字摘要儲存到 Notion summary database"""
     try:
@@ -215,6 +278,49 @@ def save_summary_to_notion(content, summary, category):
         return True
     except Exception as e:
         app.logger.error(f"儲存摘要到 Notion 時發生錯誤: {str(e)}")
+        return False
+
+
+def save_image_to_notion(title, description, tags, drive_link):
+    """將圖片資訊儲存到 Notion image database"""
+    try:
+        notion_client.pages.create(
+            parent={"database_id": NOTION_IMAGE_DATABASE_ID},
+            properties={
+                "Name": {
+                    "title": [
+                        {
+                            "text": {
+                                "content": title
+                            }
+                        }
+                    ]
+                },
+                "Description": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": description
+                            }
+                        }
+                    ]
+                },
+                "Drive_Link": {
+                    "url": drive_link
+                },
+                "Tags": {
+                    "multi_select": [{"name": tag} for tag in tags]
+                },
+                "Created": {
+                    "date": {
+                        "start": datetime.now().isoformat()
+                    }
+                }
+            }
+        )
+        return True
+    except Exception as e:
+        app.logger.error(f"儲存圖片到 Notion 時發生錯誤: {str(e)}")
         return False
 
 
@@ -273,6 +379,79 @@ def process_summary_background(text, user_id):
                     PushMessageRequest(
                         to=user_id,
                         messages=[TextMessage(text="抱歉，處理文字摘要時發生錯誤。")]
+                    )
+                )
+        except:
+            pass
+
+
+def process_image_background(message_id, user_id):
+    """背景處理圖片訊息的函數"""
+    try:
+        # 導入 Google Drive 模組
+        from google_drive import upload_image_to_drive
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_blob_api = MessagingApiBlob(api_client)
+
+            # 1. 下載圖片
+            image_content = line_bot_blob_api.get_message_content(message_id)
+            image_bytes = image_content
+
+            # 2. 使用 Vision API 分析圖片
+            description, tags = analyze_image_with_vision(image_bytes)
+
+            # 3. 生成標題（使用描述的前 50 個字）
+            title = description[:50] + "..." if len(description) > 50 else description
+
+            # 4. 上傳到 Google Drive
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"linebot_image_{timestamp}.jpg"
+
+            drive_result = upload_image_to_drive(
+                image_bytes,
+                filename,
+                folder_id=GOOGLE_DRIVE_FOLDER_ID
+            )
+
+            if not drive_result:
+                raise Exception("上傳到 Google Drive 失敗")
+
+            drive_link = drive_result['web_view_link']
+
+            # 5. 儲存到 Notion
+            saved = save_image_to_notion(title, description, tags, drive_link)
+
+            # 6. 發送結果通知
+            if saved:
+                tags_str = ', '.join(tags)
+                push_text = f"""✅ 圖片已儲存
+
+📝 描述：{description}
+
+🏷️ 標籤：{tags_str}
+
+🔗 Google Drive: {drive_link}"""
+            else:
+                push_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n圖片已上傳到 Drive: {drive_link}"
+
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=push_text)]
+                )
+            )
+
+    except Exception as e:
+        app.logger.error(f"背景處理圖片訊息時發生錯誤: {str(e)}")
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text=f"抱歉，處理圖片時發生錯誤：{str(e)}")]
                     )
                 )
         except:
@@ -438,6 +617,42 @@ def handle_audio_message(event):
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
                     messages=[TextMessage(text="抱歉，處理語音訊息時發生錯誤。")]
+                )
+            )
+
+
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    """處理圖片訊息，立即回應並在背景處理"""
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+
+        try:
+            message_id = event.message.id
+            user_id = event.source.user_id
+
+            # 立即回覆
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="🖼️ 收到圖片，正在分析並上傳到 Google Drive...")]
+                )
+            )
+
+            # 背景處理
+            thread = threading.Thread(
+                target=process_image_background,
+                args=(message_id, user_id)
+            )
+            thread.daemon = True
+            thread.start()
+
+        except Exception as e:
+            app.logger.error(f"處理圖片訊息時發生錯誤: {str(e)}")
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="抱歉，處理圖片訊息時發生錯誤。")]
                 )
             )
 

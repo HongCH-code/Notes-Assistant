@@ -224,6 +224,77 @@ def analyze_image_with_vision(image_bytes):
         return "圖片內容", ["未分類"]
 
 
+def extract_url_from_text(text):
+    """從文字中提取第一個 URL"""
+    import re
+    from urllib.parse import urlparse
+
+    # 正則表達式匹配 HTTP/HTTPS URL
+    url_pattern = r'https?://[^\s]+'
+    urls = re.findall(url_pattern, text)
+
+    if not urls:
+        return None
+
+    # 驗證第一個 URL 格式
+    first_url = urls[0]
+    try:
+        result = urlparse(first_url)
+        if result.scheme and result.netloc:
+            return first_url
+    except:
+        pass
+
+    return None
+
+
+def scrape_web_content(url):
+    """從 URL 抓取網頁內容並提取純文字"""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+
+        # 設定 User-Agent 避免被封鎖
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+
+        # 發送請求（30 秒超時）
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding
+
+        # 解析 HTML
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # 移除不需要的元素
+        for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'form']):
+            element.decompose()
+
+        # 提取純文字
+        text = soup.get_text(separator='\n', strip=True)
+
+        # 清理空白行
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        cleaned_text = '\n'.join(lines)
+
+        # 限制長度（避免超過 OpenAI token 限制）
+        if len(cleaned_text) > 10000:
+            cleaned_text = cleaned_text[:10000] + "\n\n[內容過長，已截斷...]"
+
+        return cleaned_text
+
+    except requests.exceptions.Timeout:
+        app.logger.error(f"抓取 URL 超時: {url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"抓取 URL 時發生錯誤: {str(e)}")
+        return None
+    except Exception as e:
+        app.logger.error(f"解析網頁內容時發生錯誤: {str(e)}")
+        return None
+
+
 def save_summary_to_notion(content, summary, category):
     """將文字摘要儲存到 Notion summary database"""
     try:
@@ -385,6 +456,59 @@ def process_summary_background(text, user_id):
             pass
 
 
+def process_url_background(url, user_id):
+    """背景處理 URL 摘要的函數"""
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            # 1. 抓取網頁內容
+            web_content = scrape_web_content(url)
+
+            if not web_content:
+                # 抓取失敗
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text="⚠️ 無法抓取網頁內容，請檢查 URL 是否正確或稍後再試。")]
+                    )
+                )
+                return
+
+            # 2. 生成摘要和分類（重用現有函數）
+            summary, category = generate_summary_and_category(web_content)
+
+            # 3. 儲存到 Notion（URL 存 Content，摘要存 Summary）
+            saved = save_summary_to_notion(url, summary, category)
+
+            # 4. 推送結果
+            if saved:
+                push_text = f"✅ 網頁已摘要並儲存到 Notion\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
+            else:
+                push_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
+
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=push_text)]
+                )
+            )
+
+    except Exception as e:
+        app.logger.error(f"背景處理 URL 摘要時發生錯誤: {str(e)}")
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text="抱歉，處理 URL 摘要時發生錯誤。")]
+                    )
+                )
+        except:
+            pass
+
+
 def process_image_background(message_id, user_id):
     """背景處理圖片訊息的函數"""
     try:
@@ -460,20 +584,39 @@ def process_image_background(message_id, user_id):
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event):
-    """處理文字訊息，支援 /a 指令進行文字摘要"""
+    """處理文字訊息，支援 URL 自動摘要和 /a 指令進行文字摘要"""
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
         try:
             text = event.message.text.strip()
 
-            # 檢查是否為 /a 指令（文字摘要功能）
+            # 最高優先級：檢查是否包含 URL
+            url = extract_url_from_text(text)
+            if url:
+                # 立即回覆
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="🔗 偵測到 URL，正在抓取並生成摘要...")]
+                    )
+                )
+
+                # 背景處理
+                user_id = event.source.user_id
+                thread = threading.Thread(
+                    target=process_url_background,
+                    args=(url, user_id)
+                )
+                thread.daemon = True
+                thread.start()
+                return
+
+            # 次優先級：/a 指令（保持原有功能）
             if text.startswith('/a'):
-                # 提取實際內容（去掉 /a 指令）
                 content = text[2:].strip()
 
                 if not content:
-                    # 如果沒有內容，提示用戶
                     line_bot_api.reply_message_with_http_info(
                         ReplyMessageRequest(
                             reply_token=event.reply_token,
@@ -482,7 +625,6 @@ def handle_text_message(event):
                     )
                     return
 
-                # 立即回覆「處理中」
                 line_bot_api.reply_message_with_http_info(
                     ReplyMessageRequest(
                         reply_token=event.reply_token,
@@ -490,7 +632,6 @@ def handle_text_message(event):
                     )
                 )
 
-                # 啟動背景線程處理摘要
                 user_id = event.source.user_id
                 thread = threading.Thread(
                     target=process_summary_background,
@@ -498,15 +639,15 @@ def handle_text_message(event):
                 )
                 thread.daemon = True
                 thread.start()
+                return
 
-            else:
-                # 一般文字訊息，Echo Bot 行為
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=text)]
-                    )
+            # 預設：Echo Bot
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=text)]
                 )
+            )
 
         except Exception as e:
             app.logger.error(f"處理文字訊息時發生錯誤: {str(e)}")

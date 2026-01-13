@@ -40,6 +40,7 @@ NOTION_IMAGE_DATABASE_ID = os.getenv('NOTION_IMAGE_DATABASE_ID')
 GOOGLE_CREDENTIALS_PATH = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
 GOOGLE_TOKEN_PATH = os.getenv('GOOGLE_TOKEN_PATH', 'token.json')
 GOOGLE_DRIVE_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID')
+APIFY_API_KEY = os.getenv('APIFY_API_KEY')
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
     raise ValueError('請設定 LINE_CHANNEL_ACCESS_TOKEN 和 LINE_CHANNEL_SECRET 環境變數')
@@ -55,6 +56,9 @@ if not NOTION_SUMMARY_DATABASE_ID:
 
 if not NOTION_IMAGE_DATABASE_ID:
     raise ValueError('請設定 NOTION_IMAGE_DATABASE_ID 環境變數')
+
+if not APIFY_API_KEY:
+    raise ValueError('請設定 APIFY_API_KEY 環境變數')
 
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
@@ -248,6 +252,242 @@ def extract_url_from_text(text):
     return None
 
 
+def is_facebook_url(url):
+    """檢測 URL 是否為 Facebook 連結"""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+        # 檢查域名是否為 Facebook 相關
+        facebook_domains = ['facebook.com', 'fb.com', 'm.facebook.com', 'www.facebook.com']
+        return any(domain in parsed.netloc.lower() for domain in facebook_domains)
+    except:
+        return False
+
+
+def is_instagram_url(url):
+    """檢測 URL 是否為 Instagram 連結"""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+        # 檢查域名是否為 Instagram 相關
+        instagram_domains = ['instagram.com', 'www.instagram.com', 'instagr.am']
+        return any(domain in parsed.netloc.lower() for domain in instagram_domains)
+    except:
+        return False
+
+
+def scrape_instagram_content(url):
+    """使用 Apify API 爬取 Instagram 貼文內容"""
+    try:
+        import requests
+        import time
+
+        # Apify API endpoint for Instagram scraper
+        # 使用 Apify 的 Instagram Scraper（更通用穩定）
+        apify_actor_id = "apify~instagram-scraper"
+
+        # 啟動 Actor
+        run_url = f"https://api.apify.com/v2/acts/{apify_actor_id}/runs?token={APIFY_API_KEY}"
+
+        # Actor input configuration
+        run_input = {
+            "directUrls": [url],
+            "resultsType": "posts",
+            "resultsLimit": 1,
+            "searchLimit": 1,
+            "addParentData": False
+        }
+
+        # 發送請求啟動 Actor
+        response = requests.post(run_url, json=run_input)
+        response.raise_for_status()
+
+        run_data = response.json()
+        run_id = run_data['data']['id']
+
+        # 等待 Actor 執行完成（最多等待 60 秒）
+        max_wait_time = 60
+        wait_interval = 2
+        elapsed_time = 0
+
+        while elapsed_time < max_wait_time:
+            # 檢查執行狀態
+            status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_API_KEY}"
+            status_response = requests.get(status_url)
+            status_data = status_response.json()
+
+            status = status_data['data']['status']
+
+            if status == 'SUCCEEDED':
+                # 獲取結果
+                dataset_id = status_data['data']['defaultDatasetId']
+                results_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_API_KEY}"
+
+                results_response = requests.get(results_url)
+                results = results_response.json()
+
+                if results and len(results) > 0:
+                    post = results[0]
+
+                    # 提取 Instagram 貼文的主要內容
+                    text_parts = []
+
+                    # 嘗試不同的欄位名稱（不同 scraper 可能使用不同名稱）
+                    caption = post.get('caption') or post.get('text') or post.get('description')
+                    if caption:
+                        text_parts.append(f"貼文內容：\n{caption}")
+
+                    post_url = post.get('url') or post.get('postUrl') or post.get('displayUrl')
+                    if post_url:
+                        text_parts.append(f"\n原始連結：{post_url}")
+
+                    # 其他可能的欄位
+                    likes = post.get('likesCount') or post.get('likes')
+                    if likes:
+                        text_parts.append(f"\n按讚數：{likes}")
+
+                    comments = post.get('commentsCount') or post.get('comments')
+                    if comments:
+                        text_parts.append(f"留言數：{comments}")
+
+                    owner = post.get('ownerUsername') or post.get('username') or post.get('owner')
+                    if owner:
+                        text_parts.append(f"發布者：@{owner}")
+
+                    content = '\n'.join(text_parts) if text_parts else str(post)
+
+                    # 限制長度
+                    if len(content) > 10000:
+                        content = content[:10000] + "\n\n[內容過長，已截斷...]"
+
+                    return content
+                else:
+                    app.logger.error("Apify 未返回 Instagram 結果")
+                    return None
+
+            elif status in ['FAILED', 'ABORTED', 'TIMED-OUT']:
+                app.logger.error(f"Apify Actor 執行失敗，狀態：{status}")
+                return None
+
+            # 繼續等待
+            time.sleep(wait_interval)
+            elapsed_time += wait_interval
+
+        # 超時
+        app.logger.error("等待 Apify Actor 執行超時")
+        return None
+
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Apify API 請求錯誤: {str(e)}")
+        return None
+    except Exception as e:
+        app.logger.error(f"爬取 Instagram 內容時發生錯誤: {str(e)}")
+        return None
+
+
+def scrape_facebook_content(url):
+    """使用 Apify API 爬取 Facebook 貼文內容"""
+    try:
+        import requests
+        import time
+
+        # Apify API endpoint for Facebook scraper
+        # 使用 Apify 的 Facebook Posts Scraper（注意：API 使用 ~ 而不是 /）
+        apify_actor_id = "apify~facebook-posts-scraper"
+
+        # 啟動 Actor
+        run_url = f"https://api.apify.com/v2/acts/{apify_actor_id}/runs?token={APIFY_API_KEY}"
+
+        # Actor input configuration
+        run_input = {
+            "startUrls": [{"url": url}],
+            "maxPosts": 1,
+            "resultsLimit": 1
+        }
+
+        # 發送請求啟動 Actor
+        response = requests.post(run_url, json=run_input)
+        response.raise_for_status()
+
+        run_data = response.json()
+        run_id = run_data['data']['id']
+
+        # 等待 Actor 執行完成（最多等待 60 秒）
+        max_wait_time = 60
+        wait_interval = 2
+        elapsed_time = 0
+
+        while elapsed_time < max_wait_time:
+            # 檢查執行狀態
+            status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_API_KEY}"
+            status_response = requests.get(status_url)
+            status_data = status_response.json()
+
+            status = status_data['data']['status']
+
+            if status == 'SUCCEEDED':
+                # 獲取結果
+                dataset_id = status_data['data']['defaultDatasetId']
+                results_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_API_KEY}"
+
+                results_response = requests.get(results_url)
+                results = results_response.json()
+
+                if results and len(results) > 0:
+                    post = results[0]
+
+                    # 提取 Facebook 貼文的主要內容
+                    text_parts = []
+
+                    if 'text' in post and post['text']:
+                        text_parts.append(f"貼文內容：\n{post['text']}")
+
+                    if 'url' in post:
+                        text_parts.append(f"\n原始連結：{post['url']}")
+
+                    # 其他可能的欄位
+                    if 'likes' in post:
+                        text_parts.append(f"\n按讚數：{post['likes']}")
+
+                    if 'comments' in post:
+                        text_parts.append(f"留言數：{post['comments']}")
+
+                    if 'shares' in post:
+                        text_parts.append(f"分享數：{post['shares']}")
+
+                    content = '\n'.join(text_parts)
+
+                    # 限制長度
+                    if len(content) > 10000:
+                        content = content[:10000] + "\n\n[內容過長，已截斷...]"
+
+                    return content
+                else:
+                    app.logger.error("Apify 未返回結果")
+                    return None
+
+            elif status in ['FAILED', 'ABORTED', 'TIMED-OUT']:
+                app.logger.error(f"Apify Actor 執行失敗，狀態：{status}")
+                return None
+
+            # 繼續等待
+            time.sleep(wait_interval)
+            elapsed_time += wait_interval
+
+        # 超時
+        app.logger.error("等待 Apify Actor 執行超時")
+        return None
+
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Apify API 請求錯誤: {str(e)}")
+        return None
+    except Exception as e:
+        app.logger.error(f"爬取 Facebook 內容時發生錯誤: {str(e)}")
+        return None
+
+
 def scrape_web_content(url):
     """從 URL 抓取網頁內容並提取純文字"""
     try:
@@ -295,8 +535,15 @@ def scrape_web_content(url):
         return None
 
 
-def save_summary_to_notion(content, summary, category):
-    """將文字摘要儲存到 Notion summary database"""
+def save_summary_to_notion(content, summary, category, source_type="文字"):
+    """將文字摘要儲存到 Notion summary database
+
+    Args:
+        content: 原始內容或 URL
+        summary: AI 生成的摘要
+        category: 內容分類（工作、學習、新聞等）
+        source_type: 來源類型（社群、網頁、文字）
+    """
     try:
         # 從摘要中擷取前 50 個字元作為標題
         title = summary[:50] + "..." if len(summary) > 50 else summary
@@ -329,6 +576,11 @@ def save_summary_to_notion(content, summary, category):
                             "name": category
                         }
                     ]
+                },
+                "Source": {
+                    "select": {
+                        "name": source_type
+                    }
                 },
                 "Summary": {
                     "rich_text": [
@@ -424,12 +676,12 @@ def process_summary_background(text, user_id):
             # 使用 AI 生成摘要和分類
             summary, category = generate_summary_and_category(text)
 
-            # 儲存到 Notion
-            saved = save_summary_to_notion(text, summary, category)
+            # 儲存到 Notion（來源類型為「文字」）
+            saved = save_summary_to_notion(text, summary, category, source_type="文字")
 
             # 準備推送訊息
             if saved:
-                push_text = f"✅ 已儲存到 Notion\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
+                push_text = f"✅ 已儲存到 Notion\n\n📝 摘要：{summary}\n\n📁 類別：{category}\n\n📄 來源：文字"
             else:
                 push_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
 
@@ -450,6 +702,112 @@ def process_summary_background(text, user_id):
                     PushMessageRequest(
                         to=user_id,
                         messages=[TextMessage(text="抱歉，處理文字摘要時發生錯誤。")]
+                    )
+                )
+        except:
+            pass
+
+
+def process_instagram_url_background(url, user_id):
+    """背景處理 Instagram URL 摘要的函數"""
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            # 1. 使用 Apify 抓取 Instagram 內容
+            ig_content = scrape_instagram_content(url)
+
+            if not ig_content:
+                # 抓取失敗
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text="⚠️ 無法抓取 Instagram 內容，請檢查 URL 是否正確或稍後再試。")]
+                    )
+                )
+                return
+
+            # 2. 生成摘要和分類
+            summary, category = generate_summary_and_category(ig_content)
+
+            # 3. 儲存到 Notion（URL 存 Content，摘要存 Summary，來源類型為「社群」）
+            saved = save_summary_to_notion(url, summary, category, source_type="社群")
+
+            # 4. 推送結果
+            if saved:
+                push_text = f"✅ Instagram 貼文已摘要並儲存到 Notion\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}\n\n📱 來源：社群"
+            else:
+                push_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
+
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=push_text)]
+                )
+            )
+
+    except Exception as e:
+        app.logger.error(f"背景處理 Instagram URL 摘要時發生錯誤: {str(e)}")
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text="抱歉，處理 Instagram URL 摘要時發生錯誤。")]
+                    )
+                )
+        except:
+            pass
+
+
+def process_facebook_url_background(url, user_id):
+    """背景處理 Facebook URL 摘要的函數"""
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            # 1. 使用 Apify 抓取 Facebook 內容
+            fb_content = scrape_facebook_content(url)
+
+            if not fb_content:
+                # 抓取失敗
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text="⚠️ 無法抓取 Facebook 內容，請檢查 URL 是否正確或稍後再試。")]
+                    )
+                )
+                return
+
+            # 2. 生成摘要和分類
+            summary, category = generate_summary_and_category(fb_content)
+
+            # 3. 儲存到 Notion（URL 存 Content，摘要存 Summary，來源類型為「社群」）
+            saved = save_summary_to_notion(url, summary, category, source_type="社群")
+
+            # 4. 推送結果
+            if saved:
+                push_text = f"✅ Facebook 貼文已摘要並儲存到 Notion\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}\n\n📱 來源：社群"
+            else:
+                push_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
+
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=push_text)]
+                )
+            )
+
+    except Exception as e:
+        app.logger.error(f"背景處理 Facebook URL 摘要時發生錯誤: {str(e)}")
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text="抱歉，處理 Facebook URL 摘要時發生錯誤。")]
                     )
                 )
         except:
@@ -478,12 +836,12 @@ def process_url_background(url, user_id):
             # 2. 生成摘要和分類（重用現有函數）
             summary, category = generate_summary_and_category(web_content)
 
-            # 3. 儲存到 Notion（URL 存 Content，摘要存 Summary）
-            saved = save_summary_to_notion(url, summary, category)
+            # 3. 儲存到 Notion（URL 存 Content，摘要存 Summary，來源類型為「網頁」）
+            saved = save_summary_to_notion(url, summary, category, source_type="網頁")
 
             # 4. 推送結果
             if saved:
-                push_text = f"✅ 網頁已摘要並儲存到 Notion\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
+                push_text = f"✅ 網頁已摘要並儲存到 Notion\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}\n\n🌐 來源：網頁"
             else:
                 push_text = f"⚠️ 儲存到 Notion 時發生錯誤\n\n🔗 URL：{url}\n\n📝 摘要：{summary}\n\n📁 類別：{category}"
 
@@ -594,23 +952,61 @@ def handle_text_message(event):
             # 最高優先級：檢查是否包含 URL
             url = extract_url_from_text(text)
             if url:
-                # 立即回覆
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="🔗 偵測到 URL，正在抓取並生成摘要...")]
-                    )
-                )
-
-                # 背景處理
                 user_id = event.source.user_id
-                thread = threading.Thread(
-                    target=process_url_background,
-                    args=(url, user_id)
-                )
-                thread.daemon = True
-                thread.start()
-                return
+
+                # 檢查是否為 Instagram URL
+                if is_instagram_url(url):
+                    # 立即回覆 Instagram 特定訊息
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text="🔗 偵測到 Instagram 連結，正在抓取並生成摘要...")]
+                        )
+                    )
+
+                    # 背景處理 Instagram URL
+                    thread = threading.Thread(
+                        target=process_instagram_url_background,
+                        args=(url, user_id)
+                    )
+                    thread.daemon = True
+                    thread.start()
+                    return
+                # 檢查是否為 Facebook URL
+                elif is_facebook_url(url):
+                    # 立即回覆 Facebook 特定訊息
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text="🔗 偵測到 Facebook 連結，正在抓取並生成摘要...")]
+                        )
+                    )
+
+                    # 背景處理 Facebook URL
+                    thread = threading.Thread(
+                        target=process_facebook_url_background,
+                        args=(url, user_id)
+                    )
+                    thread.daemon = True
+                    thread.start()
+                    return
+                else:
+                    # 一般 URL
+                    line_bot_api.reply_message_with_http_info(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text="🔗 偵測到 URL，正在抓取並生成摘要...")]
+                        )
+                    )
+
+                    # 背景處理一般 URL
+                    thread = threading.Thread(
+                        target=process_url_background,
+                        args=(url, user_id)
+                    )
+                    thread.daemon = True
+                    thread.start()
+                    return
 
             # 次優先級：/a 指令（保持原有功能）
             if text.startswith('/a'):

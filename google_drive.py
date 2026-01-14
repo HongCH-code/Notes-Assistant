@@ -5,6 +5,7 @@ Google Drive API 整合模組
 
 import os
 import io
+import json
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -20,9 +21,10 @@ def get_drive_service():
     """
     建立並返回 Google Drive API 服務實例
     處理 OAuth 2.0 認證流程：
-    - 如果 token.json 存在且有效，直接使用
+    - 優先從環境變數 GOOGLE_TOKEN_JSON 讀取（適用於雲端部署）
+    - 如果環境變數不存在，從 token.json 檔案讀取
     - 如果 token 過期，自動刷新
-    - 如果沒有 token，引導用戶授權（需要 credentials.json）
+    - 如果沒有 token，引導用戶授權（需要 credentials.json，僅限本地）
 
     Returns:
         service: Google Drive API 服務實例
@@ -31,11 +33,22 @@ def get_drive_service():
     creds = None
     token_path = os.getenv('GOOGLE_TOKEN_PATH', 'token.json')
     credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
+    token_json_env = os.getenv('GOOGLE_TOKEN_JSON')
 
-    # 檢查是否已有 token
-    if os.path.exists(token_path):
+    # 優先從環境變數讀取 token（適用於 Zeabur 等雲端環境）
+    if token_json_env:
+        try:
+            token_data = json.loads(token_json_env)
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            print("從環境變數載入 token 成功")
+        except Exception as e:
+            print(f"從環境變數載入 token 時發生錯誤: {e}")
+            creds = None
+    # 如果環境變數不存在，從檔案讀取
+    elif os.path.exists(token_path):
         try:
             creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+            print("從檔案載入 token 成功")
         except Exception as e:
             print(f"載入 token 時發生錯誤: {e}")
             creds = None
@@ -52,8 +65,14 @@ def get_drive_service():
                 # 刷新失敗，需要重新授權
                 creds = None
 
-        # 需要重新授權
+        # 需要重新授權（僅在本地環境可行）
         if not creds:
+            # 如果是從環境變數載入但失敗，給出明確提示
+            if token_json_env:
+                print("錯誤：環境變數 GOOGLE_TOKEN_JSON 無效或已過期")
+                print("請在本地重新執行 setup_google_auth.py 並更新環境變數")
+                return None
+
             if not os.path.exists(credentials_path):
                 print(f"錯誤：找不到 {credentials_path}")
                 print("請先執行 setup_google_auth.py 完成授權")
@@ -68,13 +87,14 @@ def get_drive_service():
                 print(f"OAuth 授權失敗: {e}")
                 return None
 
-        # 儲存憑證供下次使用
-        try:
-            with open(token_path, 'w') as token:
-                token.write(creds.to_json())
-            print(f"Token 已儲存到 {token_path}")
-        except Exception as e:
-            print(f"儲存 token 時發生錯誤: {e}")
+        # 儲存憑證供下次使用（僅在本地環境）
+        if not token_json_env:
+            try:
+                with open(token_path, 'w') as token:
+                    token.write(creds.to_json())
+                print(f"Token 已儲存到 {token_path}")
+            except Exception as e:
+                print(f"儲存 token 時發生錯誤: {e}")
 
     # 建立 Drive API 服務
     try:
